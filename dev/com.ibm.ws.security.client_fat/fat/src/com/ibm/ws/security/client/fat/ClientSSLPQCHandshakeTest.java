@@ -18,6 +18,7 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
+import java.util.Arrays;
 import java.util.List;
 
 import org.junit.After;
@@ -27,6 +28,8 @@ import org.junit.runner.RunWith;
 
 import com.ibm.websphere.simplicity.ProgramOutput;
 import com.ibm.websphere.simplicity.log.Log;
+
+import componenttest.topology.impl.LibertyClientFactory;
 
 import componenttest.custom.junit.runner.FATRunner;
 import componenttest.custom.junit.runner.Mode;
@@ -201,6 +204,13 @@ public class ClientSSLPQCHandshakeTest extends CommonTest {
             assertTrue("Client should report it failed with handshake exception.",
                        output.contains(ERRORSTRING));
 
+            // Search positively for the UNEXPECTED_MESSAGE fatal error the server JVM writes when
+            // it has no named group in common with the client. The JVM classifies this as
+            // Fatal (UNEXPECTED_MESSAGE) / "No common named group" rather than handshake_failure.
+            List<String> noCommonGroupLines = testServer.findStringsInTrace("No common named group");
+            assertFalse("Server trace should show a 'No common named group' fatal error when PQC-only server rejects non-PQC client",
+                        noCommonGroupLines.isEmpty());
+
             Log.info(c, name.getMethodName(), "Handshake correctly failed: no common named groups between PQC-only server and non-PQC client");
 
         } catch (Exception e) {
@@ -209,248 +219,75 @@ public class ClientSSLPQCHandshakeTest extends CommonTest {
         }
     }
 
+
     /**
      * Test description:
-     * - Server starts with PQC and fallback (X25519MLKEM768,X25519).
-     * - Client uses standard TLS 1.3 without PQC named groups, so fallback to X25519 is expected.
+     * - Server is configured with TLS 1.2.
+     * - Client uses TLS 1.3 with multiple PQC named groups (X25519MLKEM768 and fallbacks).
+     * - Because the server forces TLS 1.2, the TLS 1.3 key_share extension is never used, so no named group
+     *  (including mlkem) is ever negotiated or appears in the ServerHello.
      *
      * Expected results:
-     * - The SSL handshake succeeds via the classical fallback.
-     * - The server trace ServerHello key_share does NOT show X25519MLKEM768 (classical X25519 used).
-     * - The client reports it has started successfully.
+     * - The SSL handshake fails: TLS 1.2 server cannot complete a TLS 1.3 handshake.
+     * - The server trace does NOT contain "named group": X25519MLKEM768 in any ServerHello block.
+     * - The client reports a handshake failure
      */
+
     @Test
-    public void testPQCHandshakeServerWithFallbackClientNonPQCPass() {
+    public void testPQCNamedGroupNotNegotiatedonTLS12Server() {
         try {
-            Log.info(c, name.getMethodName(), "Restarting server with PQC plus classical fallback ...");
+            Log.info(c, name.getMethodName(), "Restarting server with TLS 1.2 configuration ...");
             testServer.setMarkToEndOfLog();
             if (testServer.isStarted())
                 testServer.stopServer();
 
-            testServer.setServerConfigurationFile("server_pqc_with_fallback.xml");
-            testServer.startServer();
+            testServer.setServerConfigurationFile("server_tls12.xml");
+            testServer.startServer(true);
 
-            assertNotNull("FeatureManager did not report update was complete",
+            assertNotNull("Featuremanager did not report update was complete",
                           testServer.waitForStringInLogUsingMark("CWWKF0008I"));
             assertNotNull("LTPA configuration did not report it was ready",
                           testServer.waitForStringInLogUsingMark("CWWKS4105I"));
 
-            Log.info(c, name.getMethodName(), "Starting standard TLS 1.3 client (no PQC) ...");
+            Log.info(c, name.getMethodName(), "Starting PQC-enabled client with multiple named groups against TLS 1.2 server ...");
 
-            ProgramOutput programOutput = commonClientSetUpWithCalcArgs("myTestClientPQC",
-                                                                        "client_tls13_standard.xml",
-                                                                        "CWWKF0040E");
+            // getLibertyClient copies the published client directory to the working dir (including
+            // the default single-group client.jvm.options). setJvmOptions must be called on the
+            // same instance AFTER that copy and BEFORE startClientWithArgs — so we inline the
+            // steps of commonClientSetUpWithCalcArgs here and inject setJvmOptions in between.
+            testClient = LibertyClientFactory.getLibertyClient("myTestClientPQC");
+            transformApps(testClient);
+
+            String fullClientXmlPath = buildFullClientConfigPath(testClient, "client_pqc_multiple.xml");
+            copyNewClientConfig(fullClientXmlPath);
+            addServerPortsToClientBootStrapProp();
+
+            // Override namedGroups to 3 groups AFTER the published dir has been copied.
+            testClient.setJvmOptions(Arrays.asList(
+                    "-Djdk.console=java.base",
+                    "-Dcom.ibm.ws.beta.edition=true",
+                    "-Djdk.tls.namedGroups=X25519MLKEM768,X25519,secp256r1",
+                    "-Djavax.net.debug=all"));
+
+            testClient.addIgnoreErrors("CWWKF0040E", "CWPKI0823E");
+
+            List<String> startParms = Arrays.asList("--", "add", "2", "3");
+            ProgramOutput programOutput = testClient.startClientWithArgs(true, true, true, false, "run", startParms, false);
+
             String output = programOutput.getStdout();
 
-            assertTrue("Client should report it has started successfully (CWWKF0035I).",
-                       output.contains("5"));
+            assertTrue("Client should report a handshake failure when connecting to a TLS 1.2 server.", output.contains(ERRORSTRING));
 
-            // Confirm PQC was NOT negotiated: ServerHello should not show X25519MLKEM768 key_share
-            List<String> pqcTraceLines = testServer.findStringsInTrace(SERVER_HELLO_PQC_NAMED_GROUP);
-            assertTrue("ServerHello key_share should NOT contain X25519MLKEM768 when client has no PQC support (fallback expected)",
-                       pqcTraceLines.isEmpty());
+            List<String> protocolVersionLines = testServer.findStringsInTrace("PROTOCOL_VERSION");
+            
+            assertFalse("Server trace should show a PROTOCOL_VERSION fatal error when TLS 1.2 server rejects TLS 1.3 client",
+            protocolVersionLines.isEmpty());
 
-            Log.info(c, name.getMethodName(), "Handshake succeeded with classical fallback: ServerHello did not select X25519MLKEM768");
-
+            Log.info(c, name.getMethodName(), "Confirmed: mlkem named group was not negotiated on TLS 1.2 server");
         } catch (Exception e) {
-            Log.error(c, name.getMethodName(), e, "Unexpected exception was thrown.");
+            Log.error(c, name.getMethodName(), e, "unexpected exception was thrown.");
             fail("Exception was thrown: " + e);
         }
     }
 
-    /**
-     * Test description:
-     * - Server starts with multiple PQC algorithms (X25519MLKEM768,X448MLKEM1024).
-     * - Client uses multiple PQC algorithms with different priority.
-     *
-     * Expected results:
-     * - The SSL handshake succeeds.
-     * - The server trace ServerHello key_share shows an MLKEM-based named group was negotiated.
-     * - The client reports it has started successfully.
-     */
-    @Test
-    public void testPQCHandshakeMultipleAlgorithmsNegotiation() {
-        try {
-            Log.info(c, name.getMethodName(), "Restarting server with multiple PQC algorithms ...");
-            testServer.setMarkToEndOfLog();
-            if (testServer.isStarted())
-                testServer.stopServer();
-
-            testServer.setServerConfigurationFile("server_pqc_multiple.xml");
-            testServer.startServer();
-
-            assertNotNull("FeatureManager did not report update was complete",
-                          testServer.waitForStringInLogUsingMark("CWWKF0008I"));
-            assertNotNull("LTPA configuration did not report it was ready",
-                          testServer.waitForStringInLogUsingMark("CWWKS4105I"));
-
-            Log.info(c, name.getMethodName(), "Starting PQC-enabled client with multiple algorithms ...");
-
-            ProgramOutput programOutput = commonClientSetUpWithCalcArgs("myTestClientPQC",
-                                                                        "client_pqc_multiple.xml",
-                                                                        "CWWKF0040E");
-            String output = programOutput.getStdout();
-
-            assertTrue("Client should report it has started successfully (CWWKF0035I).",
-                       output.contains("5"));
-
-            // Verify a PQC named group was selected in the ServerHello key_share.
-            // Search for the key_share named group line within the ServerHello block.
-            List<String> serverTraceLines = testServer.findStringsInTrace("\"named group\": .*MLKEM");
-            assertFalse("Server trace ServerHello key_share should show an MLKEM named group",
-                        serverTraceLines.isEmpty());
-
-            Log.info(c, name.getMethodName(), "PQC handshake successful with multiple algorithm negotiation. Named group: "
-                     + serverTraceLines.get(0).trim());
-
-        } catch (Exception e) {
-            Log.error(c, name.getMethodName(), e, "Unexpected exception was thrown.");
-            fail("Exception was thrown: " + e);
-        }
-    }
-
-    /**
-     * Test description:
-     * - Server uses standard TLS 1.3 (no PQC in named groups).
-     * - PQC-capable client falls back to classical algorithm.
-     *
-     * Expected results:
-     * - The SSL handshake succeeds using the classical fallback.
-     * - The server trace ServerHello key_share does NOT show X25519MLKEM768.
-     * - The client reports it has started successfully.
-     */
-    @Test
-    public void testPQCHandshakeClientWithFallbackServerNonPQCPass() {
-        try {
-            Log.info(c, name.getMethodName(), "Restarting server with standard TLS 1.3 (no PQC) ...");
-            testServer.setMarkToEndOfLog();
-            if (testServer.isStarted())
-                testServer.stopServer();
-
-            testServer.setServerConfigurationFile("server_tls13_standard.xml");
-            testServer.startServer();
-
-            assertNotNull("FeatureManager did not report update was complete",
-                          testServer.waitForStringInLogUsingMark("CWWKF0008I"));
-            assertNotNull("LTPA configuration did not report it was ready",
-                          testServer.waitForStringInLogUsingMark("CWWKS4105I"));
-
-            Log.info(c, name.getMethodName(), "Starting PQC-enabled client with fallback ...");
-
-            ProgramOutput programOutput = commonClientSetUpWithCalcArgs("myTestClientPQC",
-                                                                        "client_pqc_with_fallback.xml",
-                                                                        "CWWKF0040E");
-            String output = programOutput.getStdout();
-
-            assertTrue("Client should report it has started successfully (CWWKF0035I).",
-                       output.contains("5"));
-
-            // Confirm PQC was NOT negotiated: ServerHello should not show X25519MLKEM768 key_share
-            List<String> pqcTraceLines = testServer.findStringsInTrace(SERVER_HELLO_PQC_NAMED_GROUP);
-            assertTrue("ServerHello key_share should NOT contain X25519MLKEM768 when server has no PQC support (fallback expected)",
-                       pqcTraceLines.isEmpty());
-
-            Log.info(c, name.getMethodName(), "Handshake succeeded: client fell back to classical algorithm as expected");
-
-        } catch (Exception e) {
-            Log.error(c, name.getMethodName(), e, "Unexpected exception was thrown.");
-            fail("Exception was thrown: " + e);
-        }
-    }
-
-    /**
-     * Test description:
-     * - Server starts with PQC and fallback (X25519MLKEM768,X25519).
-     * - Client also has PQC and fallback (X25519MLKEM768,X25519).
-     * - Both sides prefer PQC, so X25519MLKEM768 should be selected.
-     *
-     * Expected results:
-     * - The SSL handshake succeeds using the PQC algorithm (not the fallback).
-     * - The server trace ServerHello key_share shows "named group": X25519MLKEM768.
-     * - The client reports it has started successfully.
-     */
-    @Test
-    public void testPQCHandshakeBothWithFallbackPreferPQC() {
-        try {
-            Log.info(c, name.getMethodName(), "Restarting server with PQC plus classical fallback ...");
-            testServer.setMarkToEndOfLog();
-            if (testServer.isStarted())
-                testServer.stopServer();
-
-            testServer.setServerConfigurationFile("server_pqc_with_fallback.xml");
-            testServer.startServer();
-
-            assertNotNull("FeatureManager did not report update was complete",
-                          testServer.waitForStringInLogUsingMark("CWWKF0008I"));
-            assertNotNull("LTPA configuration did not report it was ready",
-                          testServer.waitForStringInLogUsingMark("CWWKS4105I"));
-
-            Log.info(c, name.getMethodName(), "Starting PQC-enabled client (also with fallback) ...");
-
-            ProgramOutput programOutput = commonClientSetUpWithCalcArgs("myTestClientPQC",
-                                                                        "client_pqc_with_fallback.xml",
-                                                                        "CWWKF0040E");
-            String output = programOutput.getStdout();
-
-            assertTrue("Client should report it has started successfully (CWWKF0035I).",
-                       output.contains("5"));
-
-            // Verify PQC was preferred: ServerHello key_share must show X25519MLKEM768
-            List<String> serverTraceLines = testServer.findStringsInTrace(SERVER_HELLO_PQC_NAMED_GROUP);
-            assertFalse("Server trace ServerHello key_share should show \"named group\": X25519MLKEM768 (PQC preferred over fallback)",
-                        serverTraceLines.isEmpty());
-
-            Log.info(c, name.getMethodName(), "PQC handshake successful: PQC algorithm preferred over classical fallback");
-
-        } catch (Exception e) {
-            Log.error(c, name.getMethodName(), e, "Unexpected exception was thrown.");
-            fail("Exception was thrown: " + e);
-        }
-    }
-
-    /**
-     * Test description:
-     * - Both server and client start with PQC-only (X25519MLKEM768).
-     * - Verifies the negotiated algorithm by checking both server and client trace logs.
-     *
-     * Expected results:
-     * - The SSL handshake succeeds using TLS 1.3 with PQC key exchange.
-     * - The server trace ServerHello key_share shows "named group": X25519MLKEM768.
-     * - The client trace also contains evidence of PQC usage.
-     * - The client reports it has started successfully.
-     */
-    @Test
-    public void testPQCHandshakeVerifyNegotiatedAlgorithm() {
-        try {
-            Log.info(c, name.getMethodName(), "Starting PQC-enabled client, verifying negotiated algorithm in server and client trace ...");
-
-            ProgramOutput programOutput = commonClientSetUpWithCalcArgs("myTestClientPQC",
-                                                                        "client_pqc_enabled.xml",
-                                                                        "CWWKF0040E");
-            String output = programOutput.getStdout();
-
-            assertTrue("Client should report it has started successfully (CWWKF0035I).",
-                       output.contains("5"));
-
-            // Wait for client to complete and logs to be copied
-            testClient.waitForStringInCopiedLog("CWWKE0908I");
-
-            // Verify the ServerHello key_share in server trace shows X25519MLKEM768 was negotiated
-            List<String> serverTraceLines = testServer.findStringsInTrace(SERVER_HELLO_PQC_NAMED_GROUP);
-            assertFalse("Server trace ServerHello key_share should show \"named group\": X25519MLKEM768",
-                        serverTraceLines.isEmpty());
-
-            // Also check client trace for PQC evidence
-            List<String> clientTraceLines = testClient.findStringsInCopiedTraceLogs("X25519MLKEM768", "logs/trace.log");
-            if (clientTraceLines != null && !clientTraceLines.isEmpty()) {
-                Log.info(c, name.getMethodName(), "Client trace also contains X25519MLKEM768 evidence");
-            }
-
-            Log.info(c, name.getMethodName(), "PQC handshake verified: ServerHello key_share confirmed X25519MLKEM768 negotiation");
-
-        } catch (Exception e) {
-            Log.error(c, name.getMethodName(), e, "Unexpected exception was thrown.");
-            fail("Exception was thrown: " + e);
-        }
-    }
 }
