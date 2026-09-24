@@ -171,11 +171,14 @@ public class ClientSSLPQCHandshakeTest extends CommonTest {
 
     /**
      * Test description:
-     * - Server starts with PQC-only named groups (X25519MLKEM768) via server config override.
-     * - Client uses standard TLS 1.3 without PQC named groups.
+     * - Server restarts with PQC-only named groups: jvm.options overridden to X25519MLKEM768 only
+     *   (no classical fallback at the JVM TLS layer).
+     * - Client uses TLS 1.3 with non-PQC named groups only (x25519, secp256r1), overriding the
+     *   published client.jvm.options via setJvmOptions after getLibertyClient() copies the dir.
      *
      * Expected results:
-     * - The SSL handshake fails because the server only supports PQC and the client does not.
+     * - The SSL handshake fails: server has only X25519MLKEM768, client offers no PQC groups.
+     * - Server trace shows "No common named group" fatal error.
      * - The client reports a handshake exception.
      */
     @Test
@@ -186,6 +189,13 @@ public class ClientSSLPQCHandshakeTest extends CommonTest {
             if (testServer.isStarted())
                 testServer.stopServer();
 
+            // Override the server JVM to X25519MLKEM768 only — the XML namedGroups attribute alone
+            // is not enforced at the JVM TLS layer, so this is the only way to restrict the server.
+            testServer.setJvmOptions(Arrays.asList(
+                    "-Dcom.ibm.ws.beta.edition=true",
+                    "-Djdk.tls.namedGroups=X25519MLKEM768",
+                    "-Djavax.net.debug=all"));
+
             testServer.setServerConfigurationFile("server_pqc_only.xml");
             testServer.startServer();
 
@@ -194,11 +204,29 @@ public class ClientSSLPQCHandshakeTest extends CommonTest {
             assertNotNull("LTPA configuration did not report it was ready",
                           testServer.waitForStringInLogUsingMark("CWWKS4105I"));
 
-            Log.info(c, name.getMethodName(), "Starting standard TLS 1.3 client (no PQC) ...");
+            Log.info(c, name.getMethodName(), "Starting standard TLS 1.3 client (no PQC named groups) ...");
 
-            ProgramOutput programOutput = commonClientSetUpWithCalcArgs("myTestClientPQC",
-                                                                        "client_tls13_standard.xml",
-                                                                        "CWWKF0040E", "CWPKI0823E");
+            // getLibertyClient copies the published client dir (including the default
+            // client.jvm.options with X25519MLKEM768). setJvmOptions must be called on the
+            // same instance AFTER that copy and BEFORE startClientWithArgs to override to
+            // non-PQC groups only, matching the test constraint.
+            testClient = LibertyClientFactory.getLibertyClient("myTestClientPQC");
+            transformApps(testClient);
+
+            String fullClientXmlPath = buildFullClientConfigPath(testClient, "client_tls13_standard.xml");
+            copyNewClientConfig(fullClientXmlPath);
+            addServerPortsToClientBootStrapProp();
+
+            testClient.setJvmOptions(Arrays.asList(
+                    "-Djdk.console=java.base",
+                    "-Dcom.ibm.ws.beta.edition=true",
+                    "-Djdk.tls.namedGroups=x25519,secp256r1",
+                    "-Djavax.net.debug=all"));
+
+            testClient.addIgnoreErrors("CWWKF0040E", "CWPKI0823E");
+
+            List<String> startParms = Arrays.asList("--", "add", "2", "3");
+            ProgramOutput programOutput = testClient.startClientWithArgs(true, true, true, false, "run", startParms, false);
             String output = programOutput.getStdout();
 
             assertTrue("Client should report it failed with handshake exception.",
